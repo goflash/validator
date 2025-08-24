@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/goflash/flash/v2/ctx"
 )
 
 // Validator is the global validator instance for goflash validation helpers.
@@ -73,8 +74,12 @@ type FieldErrors map[string]string
 
 func (e FieldErrors) Error() string { return "field validation errors" }
 
-// ToFieldErrors converts validator.ValidationErrors into a simple field->message map.
-// If err is not a ValidationErrors, it returns a single entry under "_error".
+// ToFieldErrors converts various error types into a simple field->message map.
+// Supports:
+// - flash ctx.FieldErrors (BindJSON errors for unknown fields/type mismatches)
+// - go-playground validator.ValidationErrors
+// - validate.FieldErrors (this package)
+// Falls back to {"_error": err.Error()} otherwise.
 func ToFieldErrors(err error) map[string]string { return ToFieldErrorsWith(err, messageFunc) }
 
 // ToFieldErrorsWith is like ToFieldErrors but allows providing a custom message function
@@ -85,23 +90,87 @@ func ToFieldErrorsWith(err error, fn func(validator.FieldError) string) map[stri
 	if err == nil {
 		return res
 	}
-	if vErrs, ok := err.(validator.ValidationErrors); ok {
-		for _, fe := range vErrs {
-			// Prefer json tag name when present; otherwise use struct field name.
-			field := fe.StructField()
-			if f := fe.Field(); f != "" {
-				field = f
-			}
-			msg := humanMessageWith(fe, fn)
-			res[field] = msg
-		}
-	} else if fe, ok := err.(FieldErrors); ok { // Handle custom FieldErrors directly without copy
-		// Preserve the underlying map by reusing it as the result
-		res = map[string]string(fe)
-	} else {
-		res["_error"] = err.Error()
+
+	switch err.(type) {
+	case ctx.FieldErrors:
+		_ = handleCtxFieldErrors(err, res)
+		return res
+	case validator.ValidationErrors:
+		_ = handleValidationErrors(err, res, fn)
+		return res
+	case FieldErrors:
+		_ = handleDirectFieldErrors(err, res)
+		return res
 	}
+	if handled := handleStructuredErrorMessage(err, res); handled {
+		return res
+	}
+	// Final fallback
+	res["_error"] = err.Error()
 	return res
+}
+
+// handleCtxFieldErrors maps ctx.FieldErrors into res and merges extras from the aggregated message.
+func handleCtxFieldErrors(err error, res map[string]string) bool {
+	fe, ok := err.(ctx.FieldErrors)
+	if !ok {
+		return false
+	}
+	for _, e := range fe.All() {
+		f := normalizeFieldKey(e.Field())
+		if f == "" {
+			continue
+		}
+		res[f] = e.Message()
+	}
+	if extras := parseStructuredErrors(err.Error()); len(extras) > 0 {
+		for k, v := range extras {
+			if _, exists := res[k]; !exists {
+				res[k] = v
+			}
+		}
+	}
+	return true
+}
+
+// handleValidationErrors maps go-playground validator.ValidationErrors into res.
+func handleValidationErrors(err error, res map[string]string, fn func(validator.FieldError) string) bool {
+	vErrs, ok := err.(validator.ValidationErrors)
+	if !ok {
+		return false
+	}
+	for _, fe := range vErrs {
+		field := fe.Field()
+		if field == "" {
+			field = fe.StructField()
+		}
+		res[field] = humanMessageWith(fe, fn)
+	}
+	return true
+}
+
+// handleDirectFieldErrors copies this package's FieldErrors into res.
+func handleDirectFieldErrors(err error, res map[string]string) bool {
+	fe, ok := err.(FieldErrors)
+	if !ok {
+		return false
+	}
+	for k, v := range fe {
+		res[k] = v
+	}
+	return true
+}
+
+// handleStructuredErrorMessage parses mapstructure/BindJSON-style errors and populates res.
+func handleStructuredErrorMessage(err error, res map[string]string) bool {
+	fieldErrors := parseStructuredErrors(err.Error())
+	if len(fieldErrors) == 0 {
+		return false
+	}
+	for k, v := range fieldErrors {
+		res[k] = v
+	}
+	return true
 }
 
 // ToFieldErrorsWithContext uses a request-scoped message function from context
@@ -128,6 +197,160 @@ func humanMessageWith(fe validator.FieldError, fn func(validator.FieldError) str
 		}
 	}
 	return defaultMessage(fe)
+}
+
+// normalizeFieldKey cleans a field key coming from ctx.FieldErrors.
+// It returns empty string for aggregated/complex error messages that contain
+// newlines or complex formatting, keeping only simple field names.
+func normalizeFieldKey(s string) string {
+	if s == "" {
+		return ""
+	}
+
+	// If the original field key contains newlines, it's likely an aggregated
+	// error message that should be filtered out entirely
+	if strings.ContainsAny(s, "\r\n") {
+		return ""
+	}
+
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+
+	// Only allow simple tokens: letters, numbers, dot, dash, underscore
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if !(ch == '.' || ch == '-' || ch == '_' || (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
+			return ""
+		}
+	}
+	return s
+}
+
+// parseStructuredErrors attempts to parse structured error messages from
+// mapstructure/BindJSON errors and extract field-specific errors.
+// It handles patterns like:
+// "1 error(s) decoding:\n\n* 'field' expected type 'string', got unconvertible type 'float64', value: '1'"
+func parseStructuredErrors(errMsg string) map[string]string {
+	result := map[string]string{}
+
+	// Look for mapstructure-style errors
+	lines := strings.Split(errMsg, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "*") {
+			continue
+		}
+
+		// Parse patterns like: "* 'field' expected type 'string', got unconvertible type 'float64', value: '1'"
+		if matches := parseFieldTypeError(line); matches != nil {
+			fieldName := matches["field"]
+			expectedType := matches["expected"]
+			gotType := matches["got"]
+
+			if fieldName != "" {
+				// Create a human-friendly error message
+				var msg string
+				if expectedType != "" && gotType != "" {
+					msg = fmt.Sprintf("expected %s but got %s", expectedType, gotType)
+				} else {
+					msg = "invalid type"
+				}
+				result[fieldName] = msg
+			}
+			// continue; a single line can contain only one type error pattern
+			continue
+		}
+
+		// Parse patterns like: "* '' has invalid keys: foo, bar" or "* 'root' has invalid keys: foo"
+		if invalids := parseInvalidKeys(line); len(invalids) > 0 {
+			for _, key := range invalids {
+				// Don't overwrite any more specific message already parsed
+				if _, exists := result[key]; !exists {
+					result[key] = "unexpected"
+				}
+			}
+			continue
+		}
+	}
+
+	return result
+}
+
+// parseFieldTypeError extracts field name and type information from mapstructure error lines
+func parseFieldTypeError(line string) map[string]string {
+	// Pattern: "* 'field' expected type 'string', got unconvertible type 'float64', value: '1'"
+	// Also handle: "* 'field' expected type 'string', got unconvertible type 'float64'"
+
+	result := map[string]string{}
+
+	// Extract field name between first pair of single quotes
+	if start := strings.Index(line, "'"); start != -1 {
+		if end := strings.Index(line[start+1:], "'"); end != -1 {
+			fieldName := line[start+1 : start+1+end]
+			result["field"] = fieldName
+		}
+	}
+
+	// Extract expected type
+	if idx := strings.Index(line, "expected type '"); idx != -1 {
+		start := idx + len("expected type '")
+		if end := strings.Index(line[start:], "'"); end != -1 {
+			expectedType := line[start : start+end]
+			result["expected"] = expectedType
+		}
+	}
+
+	// Extract actual type
+	if idx := strings.Index(line, "got unconvertible type '"); idx != -1 {
+		start := idx + len("got unconvertible type '")
+		if end := strings.Index(line[start:], "'"); end != -1 {
+			gotType := line[start : start+end]
+			result["got"] = gotType
+		}
+	} else if idx := strings.Index(line, "got "); idx != -1 {
+		// Handle simpler "got type" patterns
+		start := idx + len("got ")
+		parts := strings.Fields(line[start:])
+		if len(parts) > 0 {
+			gotType := strings.Trim(parts[0], "',")
+			result["got"] = gotType
+		}
+	}
+
+	// Only return if we found at least a field name
+	if result["field"] != "" {
+		return result
+	}
+	return nil
+}
+
+// parseInvalidKeys extracts a list of unexpected field keys from a mapstructure
+// error line such as: "* ” has invalid keys: foo, bar".
+func parseInvalidKeys(line string) []string {
+	// Find the colon after the phrase and take the remainder
+	idx := strings.Index(line, "has invalid keys:")
+	if idx == -1 {
+		return nil
+	}
+	rest := line[idx+len("has invalid keys:"):]
+	// Split by commas, trim spaces and quotes
+	parts := strings.Split(rest, ",")
+	keys := make([]string, 0, len(parts))
+	for _, p := range parts {
+		k := strings.TrimSpace(p)
+		k = strings.Trim(k, "'\"")
+		// Remove trailing punctuation like ")" or "."
+		k = strings.TrimRight(k, ") .")
+		if k != "" {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	return keys
 }
 
 // defaultMessage provides a minimal, dependency-free fallback for common tags.

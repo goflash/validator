@@ -1,7 +1,7 @@
 # Validation helpers and i18n middleware for the GoFlash framework
 
 <h1 align="center">
-    <a href="https://pkg.go.dev/github.com/goflash/validator/v2@v2.0.0">
+    <a href="https://pkg.go.dev/github.com/goflash/validator/v2@v2.0.1">
         <img src="https://pkg.go.dev/badge/github.com/goflash/validator.svg" alt="Go Reference">
     </a>
     <a href="https://goreportcard.com/report/github.com/goflash/validator">
@@ -125,7 +125,6 @@ Three runnable examples are included:
 Try them locally (they use this module):
 
 ```sh
-cd examples/binding_json && go run .
 cd ../validation && go run .
 cd ../validation_with_i18n && go run .
 ```

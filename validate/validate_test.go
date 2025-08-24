@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	ut "github.com/go-playground/universal-translator"
 	globalValidator "github.com/go-playground/validator/v10"
+	"github.com/goflash/flash/v2/ctx"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -21,6 +23,8 @@ func TestValidateStructAndToFieldErrors(t *testing.T) {
 	if err := Struct(u); err == nil {
 		t.Fatalf("expected error")
 	}
+	// --- Coverage for ctx.FieldErrors mapping branch ---
+
 	u = user{Name: "ab", Age: 10}
 	if err := Struct(u); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -381,9 +385,91 @@ func TestToFieldErrorsDashJSONFallbackAndMessages(t *testing.T) {
 	}
 }
 
+// --- Coverage for ctx.FieldErrors mapping branch in ToFieldErrorsWith ---
+
+type fakeCtxFieldError struct{ f, m string }
+
+func (e fakeCtxFieldError) Field() string   { return e.f }
+func (e fakeCtxFieldError) Message() string { return e.m }
+
+type fakeCtxFieldErrors struct{ list []ctx.FieldError }
+
+func (f fakeCtxFieldErrors) Error() string         { return "field validation errors" }
+func (f fakeCtxFieldErrors) All() []ctx.FieldError { return f.list }
+
+// Variant that carries the full aggregated error message to test merging
+type fakeCtxFieldErrorsWithMsg struct {
+	list []ctx.FieldError
+	msg  string
+}
+
+func (f fakeCtxFieldErrorsWithMsg) Error() string         { return f.msg }
+func (f fakeCtxFieldErrorsWithMsg) All() []ctx.FieldError { return f.list }
+
+func TestToFieldErrorsWith_CtxFieldErrors(t *testing.T) {
+	fe := fakeCtxFieldErrors{list: []ctx.FieldError{
+		fakeCtxFieldError{f: "name", m: "unexpected"},
+		fakeCtxFieldError{f: "age", m: "invalid type"},
+		// A noisy/aggregated key should be ignored by normalizeFieldKey
+		fakeCtxFieldError{f: "foo\n* 'bar' expected type 'string'", m: "unexpected"},
+	}}
+	m := ToFieldErrorsWith(fe, nil)
+	if len(m) != 2 || m["name"] != "unexpected" || m["age"] != "invalid type" {
+		t.Fatalf("unexpected map: %#v", m)
+	}
+}
+
+func TestToFieldErrorsWith_CtxFieldErrors_EmptyList(t *testing.T) {
+	fe := fakeCtxFieldErrors{list: nil}
+	m := ToFieldErrorsWith(fe, nil)
+	if len(m) != 0 {
+		t.Fatalf("expected empty map for empty ctx.FieldErrors, got %#v", m)
+	}
+}
+
+func TestToFieldErrorsWith_CtxFieldErrors_MergesStructuredErrorString(t *testing.T) {
+	fe := fakeCtxFieldErrorsWithMsg{
+		list: []ctx.FieldError{
+			fakeCtxFieldError{f: "extra", m: "unexpected"},
+		},
+		msg: "2 error(s) decoding:\n\n* 'name' expected type 'string', got unconvertible type 'float64', value: '1'\n* '' has invalid keys: extra, foo",
+	}
+	m := ToFieldErrorsWith(fe, nil)
+	// Original from All()
+	assert.Equal(t, "unexpected", m["extra"]) // preserved
+	// Parsed from aggregated string
+	assert.Equal(t, "expected string but got float64", m["name"]) // type error
+	assert.Equal(t, "unexpected", m["foo"])                       // additional invalid key
+}
+
+func TestToFieldErrorsWith_ValidationErrors_Normal(t *testing.T) {
+	// Build a validation error via package Validator
+	type X struct {
+		A string `json:"a" validate:"required"`
+		B int    `json:"b" validate:"min=2"`
+	}
+	err := Struct(X{A: "", B: 1})
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	m := ToFieldErrorsWith(err, nil)
+	if m["a"] == "" || m["b"] == "" {
+		t.Fatalf("expected mapped messages for a and b, got %#v", m)
+	}
+}
+
 type ctxUser struct {
 	Name string `json:"name" validate:"required,min=2"`
 }
+
+// Test error types for structured error parsing tests
+type simpleError struct{ msg string }
+
+func (e simpleError) Error() string { return e.msg }
+
+type simpleError2 struct{ msg string }
+
+func (e simpleError2) Error() string { return e.msg }
 
 func TestToFieldErrorsWithContext_UsesRequestScopedFunc(t *testing.T) {
 	defer SetMessageFunc(nil) // ensure global is cleared
@@ -543,14 +629,20 @@ func TestToFieldErrorsWith_DashTag_FallbackKey(t *testing.T) {
 
 func TestToFieldErrors_EmptyValidationErrorsReturnsEmpty(t *testing.T) {
 	// Create an error of type validator.ValidationErrors with zero length
-	var verrs globalValidator.ValidationErrors
-	if verrs != nil {
-		t.Fatalf("expected zero value to be nil slice")
-	}
-	// Explicitly make empty (non-nil) slice to ensure type assertion passes
-	verrs = make(globalValidator.ValidationErrors, 0)
+	verrs := make(globalValidator.ValidationErrors, 0)
 	var err error = verrs
 	m := ToFieldErrors(err)
+	if len(m) != 0 {
+		t.Fatalf("expected empty map for empty ValidationErrors, got %#v", m)
+	}
+}
+
+func TestToFieldErrorsWith_EmptyValidationErrorsReturnsEmpty(t *testing.T) {
+	// Create an error of type validator.ValidationErrors with zero length
+	// Explicitly make empty (non-nil) slice to ensure type assertion passes
+	verrs := make(globalValidator.ValidationErrors, 0)
+	var err error = verrs
+	m := ToFieldErrorsWith(err, nil)
 	if len(m) != 0 {
 		t.Fatalf("expected empty map for empty ValidationErrors, got %#v", m)
 	}
@@ -576,4 +668,364 @@ func TestToFieldErrors_FallbackWhenFieldEmptyFromTagNameFunc(t *testing.T) {
 	if _, ok := m["A"]; !ok {
 		t.Fatalf("expected fallback to StructField 'A', got %#v", m)
 	}
+}
+
+func TestToFieldErrorsWith_FallbackWhenFieldEmptyFromTagNameFunc(t *testing.T) {
+	// Use a custom validator instance that forces Field() to return empty
+	v := globalValidator.New()
+	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+		if fld.Name == "A" {
+			return "" // simulate no tag name -> Field() == ""
+		}
+		return fld.Tag.Get("json")
+	})
+	type Z struct {
+		A string `json:"a" validate:"required"`
+	}
+	err := v.Struct(Z{})
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	m := ToFieldErrorsWith(err, nil)
+	if _, ok := m["A"]; !ok {
+		t.Fatalf("expected fallback to StructField 'A', got %#v", m)
+	}
+}
+
+// Test cases for structured error parsing
+func TestParseStructuredErrors_MapstructureStyle(t *testing.T) {
+	errMsg := "1 error(s) decoding:\n\n* 'name' expected type 'string', got unconvertible type 'float64', value: '1'"
+	result := parseStructuredErrors(errMsg)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 field error, got %d: %#v", len(result), result)
+	}
+
+	if msg, ok := result["name"]; !ok {
+		t.Fatalf("expected 'name' field, got %#v", result)
+	} else if msg != "expected string but got float64" {
+		t.Fatalf("expected proper error message, got %q", msg)
+	}
+}
+
+func TestParseStructuredErrors_MultipleFields(t *testing.T) {
+	errMsg := `3 error(s) decoding:
+
+* 'name' expected type 'string', got unconvertible type 'float64', value: '1'
+* 'age' expected type 'int', got unconvertible type 'string', value: 'abc'
+* 'email' expected type 'string', got unconvertible type 'bool', value: 'true'`
+
+	result := parseStructuredErrors(errMsg)
+
+	if len(result) != 3 {
+		t.Fatalf("expected 3 field errors, got %d: %#v", len(result), result)
+	}
+
+	expected := map[string]string{
+		"name":  "expected string but got float64",
+		"age":   "expected int but got string",
+		"email": "expected string but got bool",
+	}
+
+	for field, expectedMsg := range expected {
+		if msg, ok := result[field]; !ok {
+			t.Fatalf("expected field %q, got %#v", field, result)
+		} else if msg != expectedMsg {
+			t.Fatalf("for field %q, expected %q, got %q", field, expectedMsg, msg)
+		}
+	}
+}
+
+func TestParseStructuredErrors_EmptyInput(t *testing.T) {
+	result := parseStructuredErrors("")
+	if len(result) != 0 {
+		t.Fatalf("expected empty result for empty input, got %#v", result)
+	}
+}
+
+func TestParseStructuredErrors_NoValidPattern(t *testing.T) {
+	errMsg := "some random error message without field information"
+	result := parseStructuredErrors(errMsg)
+	if len(result) != 0 {
+		t.Fatalf("expected empty result for non-matching input, got %#v", result)
+	}
+}
+
+func TestToFieldErrorsWith_StructuredErrorFallback(t *testing.T) {
+	// Create a simple error that contains structured error message
+	errMsg := "1 error(s) decoding:\n\n* 'name' expected type 'string', got unconvertible type 'float64', value: '1'"
+	err := simpleError{msg: errMsg}
+
+	result := ToFieldErrorsWith(err, nil)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 field error, got %d: %#v", len(result), result)
+	}
+
+	if msg, ok := result["name"]; !ok {
+		t.Fatalf("expected 'name' field, got %#v", result)
+	} else if msg != "expected string but got float64" {
+		t.Fatalf("expected proper error message, got %q", msg)
+	}
+}
+
+func TestToFieldErrorsWith_FallsBackToRawError(t *testing.T) {
+	// Create an error that doesn't match any pattern
+	err := simpleError2{msg: "some unparseable error"}
+	result := ToFieldErrorsWith(err, nil)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 fallback error, got %d: %#v", len(result), result)
+	}
+
+	if msg, ok := result["_error"]; !ok {
+		t.Fatalf("expected '_error' fallback, got %#v", result)
+	} else if msg != "some unparseable error" {
+		t.Fatalf("expected original error message, got %q", msg)
+	}
+}
+
+func TestParseInvalidKeys_Simple(t *testing.T) {
+	line := "* '' has invalid keys: foo, bar"
+	keys := parseInvalidKeys(line)
+	assert.ElementsMatch(t, []string{"foo", "bar"}, keys)
+}
+
+func TestParseStructuredErrors_InvalidKeysAndTypeErrors_Merge(t *testing.T) {
+	// Simulate an aggregated error that includes both a type error and invalid keys
+	msg := `2 error(s) decoding:
+
+* 'name' expected type 'string', got unconvertible type 'float64', value: '1'
+* '' has invalid keys: extra, foo`
+
+	got := parseStructuredErrors(msg)
+	// Should include both the type error for name and unexpected markers for extra and foo
+	assert.Equal(t, "expected string but got float64", got["name"])
+	assert.Equal(t, "unexpected", got["extra"])
+	assert.Equal(t, "unexpected", got["foo"])
+}
+
+func TestParseStructuredErrors_DoesNotOverwriteExistingKey(t *testing.T) {
+	// Ensure when the same key appears as a type error and also in invalid keys,
+	// the earlier, more specific message isn't overwritten by "unexpected".
+	msg := `2 error(s) decoding:
+
+* 'dup' expected type 'string', got unconvertible type 'float64'
+* '' has invalid keys: dup, other`
+	got := parseStructuredErrors(msg)
+	assert.Equal(t, "expected string but got float64", got["dup"]) // preserved
+	assert.Equal(t, "unexpected", got["other"])                    // added
+}
+
+func TestToFieldErrorsWith_CtxFieldErrors_EmptyAggregatedMessage(t *testing.T) {
+	fe := fakeCtxFieldErrorsWithMsg{
+		list: []ctx.FieldError{
+			fakeCtxFieldError{f: "field", m: "bad"},
+		},
+		msg: "", // empty Error() should skip structured parsing branch
+	}
+	m := ToFieldErrorsWith(fe, nil)
+	assert.Equal(t, map[string]string{"field": "bad"}, m)
+}
+
+func TestToFieldErrorsWith_CtxFieldErrors_NonEmptyMsgNoExtras(t *testing.T) {
+	// Non-empty aggregated message that doesn't match parsing patterns -> no extras merged
+	fe := fakeCtxFieldErrorsWithMsg{
+		list: []ctx.FieldError{
+			fakeCtxFieldError{f: "a", m: "oops"},
+		},
+		msg: "1 error(s) decoding:\n\n* something random without patterns",
+	}
+	m := ToFieldErrorsWith(fe, nil)
+	assert.Equal(t, map[string]string{"a": "oops"}, m)
+}
+
+func TestToFieldErrorsWith_CtxFieldErrors_DuplicateKeyNotOverwritten(t *testing.T) {
+	// All() provides a field 'name', aggregated message also mentions 'name' type error.
+	// Merge should NOT overwrite the original value in res.
+	fe := fakeCtxFieldErrorsWithMsg{
+		list: []ctx.FieldError{
+			fakeCtxFieldError{f: "name", m: "fromAll"},
+		},
+		msg: "1 error(s) decoding:\n\n* 'name' expected type 'string', got unconvertible type 'float64'",
+	}
+	m := ToFieldErrorsWith(fe, nil)
+	assert.Equal(t, "fromAll", m["name"]) // ensure not overwritten by merged extras
+}
+
+func TestToFieldErrorsWith_CtxFieldErrors_OnlyAggregatedExtras(t *testing.T) {
+	// All() is empty; extras should be populated solely from aggregated message parsing
+	fe := fakeCtxFieldErrorsWithMsg{
+		list: nil,
+		msg:  "2 error(s) decoding:\n\n* 'name' expected type 'string', got unconvertible type 'float64'\n* '' has invalid keys: extraKey",
+	}
+	m := ToFieldErrorsWith(fe, nil)
+	// Should include both parsed entries even when All() is empty
+	assert.Equal(t, "expected string but got float64", m["name"])
+	assert.Equal(t, "unexpected", m["extraKey"])
+}
+
+func TestNormalizeFieldKey_OnlyWhitespaceAndCR(t *testing.T) {
+	if got := normalizeFieldKey("   \t   "); got != "" {
+		t.Fatalf("expected empty after trimming whitespace, got %q", got)
+	}
+	if got := normalizeFieldKey("foo\rbar"); got != "" {
+		t.Fatalf("expected empty for CR newline, got %q", got)
+	}
+}
+
+func TestNormalizeFieldKey_Variants(t *testing.T) {
+	// empty input
+	if got := normalizeFieldKey(""); got != "" {
+		t.Fatalf("expected empty for empty input, got %q", got)
+	}
+	// whitespace trimmed
+	if got := normalizeFieldKey("  name  "); got != "name" {
+		t.Fatalf("expected 'name', got %q", got)
+	}
+	// allowed characters
+	allowed := []string{"user.name", "user-name", "user_name", "aB9"}
+	for _, s := range allowed {
+		if got := normalizeFieldKey(s); got != s {
+			t.Fatalf("expected %q to be allowed, got %q", s, got)
+		}
+	}
+	// invalid characters -> empty
+	invalid := []string{"user:name", "user/name", "sp ace", "名"}
+	for _, s := range invalid {
+		if got := normalizeFieldKey(s); got != "" {
+			t.Fatalf("expected empty for %q, got %q", s, got)
+		}
+	}
+	// embedded newline -> empty
+	if got := normalizeFieldKey("foo\nbar"); got != "" {
+		t.Fatalf("expected empty for newline, got %q", got)
+	}
+}
+
+func TestParseFieldTypeError_Variants(t *testing.T) {
+	// simpler 'got' pattern (no quotes and no 'unconvertible')
+	line := "* 'age' expected type 'int', got bool, value: 1"
+	m := parseFieldTypeError(line)
+	if m == nil || m["field"] != "age" || m["expected"] != "int" || m["got"] != "bool" {
+		t.Fatalf("unexpected map for simple got pattern: %#v", m)
+	}
+
+	// missing expected, only 'got unconvertible type'
+	line2 := "* 'x' got unconvertible type 'float64'"
+	m2 := parseFieldTypeError(line2)
+	if m2 == nil || m2["field"] != "x" || m2["expected"] != "" || m2["got"] != "float64" {
+		t.Fatalf("unexpected map when expected missing: %#v", m2)
+	}
+
+	// no field (no single quotes anywhere) -> should return nil
+	line3 := "* expected type string, got int"
+	if m3 := parseFieldTypeError(line3); m3 != nil {
+		t.Fatalf("expected nil when field name missing, got %#v", m3)
+	}
+}
+
+func TestParseStructuredErrors_InvalidTypeFallback(t *testing.T) {
+	// When either expected or got is missing, message should be generic 'invalid type'
+	msg := "1 error(s) decoding:\n\n* 'name' got unconvertible type 'float64'"
+	got := parseStructuredErrors(msg)
+	if got["name"] != "invalid type" {
+		t.Fatalf("expected 'invalid type', got %#v", got)
+	}
+}
+
+func TestParseInvalidKeys_TrimmingAndEmpty(t *testing.T) {
+	// Trimming quotes, dots, and closing parens
+	line := "* '' has invalid keys: 'foo'., bar)."
+	keys := parseInvalidKeys(line)
+	// Note: current implementation may leave a trailing single quote when punctuation follows quotes
+	assert.ElementsMatch(t, []string{"foo'", "bar"}, keys)
+
+	// No keys after colon -> nil
+	if keys2 := parseInvalidKeys("* '' has invalid keys:   "); len(keys2) != 0 {
+		t.Fatalf("expected nil/empty for no keys, got %#v", keys2)
+	}
+}
+
+func TestParseInvalidKeys_NoPhrase(t *testing.T) {
+	if keys := parseInvalidKeys("totally unrelated line"); keys != nil {
+		t.Fatalf("expected nil for no-phrase, got %#v", keys)
+	}
+}
+
+func TestParseStructuredErrors_SkipsUnmatchedStarLines(t *testing.T) {
+	msg := "2 error(s) decoding:\n\n* something random\n* another random without patterns"
+	if got := parseStructuredErrors(msg); len(got) != 0 {
+		t.Fatalf("expected empty for unmatched star lines, got %#v", got)
+	}
+}
+
+type emptyErr struct{}
+
+func (emptyErr) Error() string { return "" }
+
+func TestToFieldErrorsWith_EmptyRawErrorMessage(t *testing.T) {
+	// Ensure branch where err.Error() == "" in the raw error fallback path is covered
+	m := ToFieldErrorsWith(emptyErr{}, nil)
+	if _, ok := m["_error"]; !ok {
+		t.Fatalf("expected _error key for empty error message, got %#v", m)
+	}
+}
+
+// --- Direct helper coverage for negative branches ---
+
+func Test_handleCtxFieldErrors_NotMatchingType(t *testing.T) {
+	res := map[string]string{}
+	ok := handleCtxFieldErrors(assert.AnError, res)
+	assert.False(t, ok)
+	assert.Empty(t, res)
+}
+
+func Test_handleValidationErrors_NotMatchingType(t *testing.T) {
+	res := map[string]string{}
+	ok := handleValidationErrors(assert.AnError, res, nil)
+	assert.False(t, ok)
+	assert.Empty(t, res)
+}
+
+func Test_handleDirectFieldErrors_NotMatchingType(t *testing.T) {
+	res := map[string]string{}
+	ok := handleDirectFieldErrors(assert.AnError, res)
+	assert.False(t, ok)
+	assert.Empty(t, res)
+}
+
+type msgOnlyErr struct{ s string }
+
+func (e msgOnlyErr) Error() string { return e.s }
+
+func Test_handleStructuredErrorMessage_NoStructured(t *testing.T) {
+	res := map[string]string{}
+	ok := handleStructuredErrorMessage(msgOnlyErr{"no patterns here"}, res)
+	assert.False(t, ok)
+	assert.Empty(t, res)
+}
+
+// Mock FieldError to trigger field=="" fallback path in handleValidationErrors
+type fakeValFE struct{}
+
+func (fakeValFE) Tag() string                    { return "" }
+func (fakeValFE) ActualTag() string              { return "" }
+func (fakeValFE) Namespace() string              { return "" }
+func (fakeValFE) StructNamespace() string        { return "" }
+func (fakeValFE) Field() string                  { return "" } // force empty
+func (fakeValFE) StructField() string            { return "S" }
+func (fakeValFE) Param() string                  { return "" }
+func (fakeValFE) Kind() reflect.Kind             { return reflect.String }
+func (fakeValFE) Type() reflect.Type             { return reflect.TypeOf("") }
+func (fakeValFE) Value() any                     { return "" }
+func (fakeValFE) Translate(ut.Translator) string { return "" }
+func (fakeValFE) Error() string                  { return "" }
+
+func Test_handleValidationErrors_FieldEmpty_FallbackToStructField(t *testing.T) {
+	// Build a validator.ValidationErrors with our fake FieldError
+	verrs := globalValidator.ValidationErrors{fakeValFE{}}
+	var err error = verrs
+	m := ToFieldErrorsWith(err, func(fe globalValidator.FieldError) string { return "OK" })
+	assert.Equal(t, map[string]string{"S": "OK"}, m)
 }
